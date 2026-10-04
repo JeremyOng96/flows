@@ -363,6 +363,10 @@ def main(cfg: DictConfig) -> None:
     _load_wandb_env(cfg)
     model = FlowDIS(cfg)
     trainer = L.Trainer(
+        accelerator=cfg.trainer.accelerator,
+        devices=cfg.trainer.devices,
+        num_nodes=cfg.trainer.num_nodes,
+        strategy=cfg.trainer.strategy,
         max_steps=cfg.trainer.max_steps,
         precision=cfg.trainer.precision,
         log_every_n_steps=cfg.trainer.log_every_n_steps,
