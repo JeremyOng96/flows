@@ -4,6 +4,7 @@ from pathlib import Path
 import lightning as L
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange, repeat
 import hydra
@@ -15,6 +16,7 @@ from scipy.special import betaincinv # inverse of the incomplete beta function
 from typing import List
 from flowdis.data.cache import build_cached_dataloader
 from flowdis.data.dataloader import DIS5KParams, build_dataloader
+from flowdis.metrics.metric_utils import SegmentationMetrics
 from flowdis.model.flux import load_flux
 
 
@@ -172,13 +174,28 @@ class FlowDIS(L.LightningModule):
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
+    def on_validation_epoch_start(self) -> None:
+        self._val_metrics = SegmentationMetrics()
+
     @torch.no_grad()
     def validation_step(self, batch: dict, batch_idx: int) -> Tensor:
         loss = self.flow_matching_loss(batch)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        if self.trainer.sanity_checking:
+            return loss
+        image = (batch["image"].float() * 0.5 + 0.5).clamp(0, 1)
+        prediction = self.flow_matching_integration(image, list(batch["prompt"]))
+        self._val_metrics.update(prediction, batch["mask"])
         if batch_idx == 0:
-            self._log_segmentation(batch)
+            self._log_segmentation(image, prediction, batch)
         return loss
+
+    def on_validation_epoch_end(self) -> None:
+        if self.trainer.sanity_checking or not self._val_metrics._mae:
+            return
+        scores = self._validation_scores()
+        for name, value in scores.items():
+            self.log(f"val/{name}", value, prog_bar=True, sync_dist=False)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -294,14 +311,27 @@ class FlowDIS(L.LightningModule):
         mask = self.vae.decode(mask.to(dtype=self.vae.dtype)).sample.clamp(-1, 1)
         return ((mask + 1) / 2).mean(dim=1).clamp(0, 1)
 
+    def _validation_scores(self) -> dict[str, float]:
+        if self.trainer.world_size == 1:
+            return self._val_metrics.compute()
+        gathered: list[SegmentationMetrics | None] = [None] * self.trainer.world_size
+        dist.all_gather_object(gathered, self._val_metrics)
+        merged = SegmentationMetrics()
+        for metrics in gathered:
+            merged._mae.extend(metrics._mae)
+            merged._weighted_f.extend(metrics._weighted_f)
+            merged._structure.extend(metrics._structure)
+            merged._f_curves.extend(metrics._f_curves)
+            merged._e_curves.extend(metrics._e_curves)
+        return merged.compute()
+
     @torch.no_grad()
-    def _log_segmentation(self, batch: dict) -> None:
+    def _log_segmentation(self, image: Tensor, prediction: Tensor, batch: dict) -> None:
         import wandb
 
-        image = (batch["image"][:4].float() * 0.5 + 0.5).clamp(0, 1)
-        prediction = self.flow_matching_integration(image, list(batch["prompt"][:4]))
         panels = []
-        for index, caption in enumerate(batch["prompt"][:4]):
+        count = min(4, image.shape[0])
+        for index, caption in enumerate(batch["prompt"][:count]):
             rgb = (image[index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
             ground_truth = np.stack([batch["mask"][index, 0].cpu().numpy()] * 3, axis=-1)
             predicted = np.stack([prediction[index].cpu().numpy()] * 3, axis=-1)
