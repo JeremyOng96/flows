@@ -1,0 +1,33 @@
+data:
+  root: "/home/ubuntu/jeremy/dataset/DIS5K_extracted"
+  split: "DIS-TR"
+  resolution: 1024
+  use_language_pairing: true
+  # DIS-TR has 4 prompts per image: "random" samples one uniformly (what the
+  # paper does), "first" always takes slot 0.
+  prompt_strategy: "random"
+  mean: 0.5
+  std: 0.5
+
+  use_transforms: true
+  transforms:
+    # The paper uses no geometric augmentation -- PAIP is the only one. These
+    # stay off unless you deliberately deviate. The resize always runs.
+    crop_scale: null        # e.g. [0.5, 1.0] to enable RandomResizedCrop
+    horizontal_flip: 0.0
+    vertical_flip: 0.0
+    interpolation: "area"
+
+loader:
+  batch_size: 4
+  num_workers: 8
+  # PAIP and shuffling default to on for DIS-TR only; set to override.
+  use_paip: null
+  seed: 0
+
+val:
+  split: "DIS-VD"
+  # One fixed prompt per image. "random" would change the loss between checks.
+  prompt_strategy: "first"
+
+output: "/home/ubuntu/jeremy/FlowDIS-reimplemented"

@@ -1,0 +1,56 @@
+root: /home/ubuntu/jeremy/FlowDIS-reimplemented
+schnell_dir: ${root}/checkpoints/FLUX.1-schnell
+
+# Loss reads z_img, z_mask, z_txt_t5, z_txt_clip from cache_dir/<split>.h5.
+# Generate those files with flowdis/scripts/cache_latents.sh before turning this on.
+# Encoders stay loaded either way, because the validation sampler still encodes.
+use_cache: false
+cache_dir: ${root}/cache
+beta_alpha: 2.5
+beta_beta: 1.0
+num_steps: 2
+
+data:
+  root: /home/ubuntu/jeremy/dataset/DIS5K_extracted
+  resolution: 1024
+  use_language_pairing: true
+  mean: 0.5
+  std: 0.5
+  train_split: DIS-TR
+  val_split: DIS-VD
+  train_prompt_strategy: random
+  val_prompt_strategy: first
+
+loader:
+  batch_size: 4
+  num_workers: 8
+  seed: 0
+
+vae_dir: ${schnell_dir}/vae
+t5_dir: ${schnell_dir}/text_encoder_2
+t5_tokenizer_dir: ${schnell_dir}/tokenizer_2
+clip_dir: ${schnell_dir}/text_encoder
+clip_tokenizer_dir: ${schnell_dir}/tokenizer
+
+trainer:
+  max_steps: 10000
+  precision: bf16-mixed
+  log_every_n_steps: 10
+
+optimizer:
+  lr: 5.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  milestones: [512, 2048, 4096, 8192]
+  gamma: 0.5
+
+wandb:
+  project: flowdis-reimplemented
+  env_file: ${root}/.wandb
+
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${root}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
