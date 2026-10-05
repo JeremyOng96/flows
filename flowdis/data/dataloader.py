@@ -48,8 +48,9 @@ class DIS5KTransforms:
     and flip knobs are therefore off by default; turn them on only when you mean
     to deviate from the paper.
 
-    The resize always runs, in train and eval alike: it is what makes samples
-    the same size and therefore collatable.
+    Eval always resizes to `resolution`. Training with PAIP leaves the native
+    size in place so pairing happens before the single resize to `resolution`
+    inside `paip_collate`.
     """
 
     # None keeps the plain resize; a (min, max) area fraction switches training
@@ -70,7 +71,7 @@ class DIS5KTransforms:
             config = OmegaConf.to_container(config, resolve=True)
         return cls(**config)
 
-    def build(self, resolution: int, train: bool) -> A.Compose:
+    def build(self, resolution: int, train: bool, resize: bool = True) -> A.Compose:
         if self.interpolation not in INTERPOLATIONS:
             raise ValueError(
                 f"unknown interpolation {self.interpolation!r}, "
@@ -78,29 +79,31 @@ class DIS5KTransforms:
             )
         interp = INTERPOLATIONS[self.interpolation]
 
-        if train and self.crop_scale is not None:
-            ops = [
-                A.RandomResizedCrop(
-                    size=(resolution, resolution),
-                    scale=tuple(self.crop_scale),
-                    interpolation=interp,
-                    mask_interpolation=interp,
+        ops = []
+        if resize:
+            if train and self.crop_scale is not None:
+                ops.append(
+                    A.RandomResizedCrop(
+                        size=(resolution, resolution),
+                        scale=tuple(self.crop_scale),
+                        interpolation=interp,
+                        mask_interpolation=interp,
+                    )
                 )
-            ]
-        else:
-            ops = [
-                A.Resize(
-                    resolution, resolution,
-                    interpolation=interp, mask_interpolation=interp,
+            else:
+                ops.append(
+                    A.Resize(
+                        resolution, resolution,
+                        interpolation=interp, mask_interpolation=interp,
+                    )
                 )
-            ]
 
         if train:
             if self.horizontal_flip > 0:
                 ops.append(A.HorizontalFlip(p=self.horizontal_flip))
             if self.vertical_flip > 0:
                 ops.append(A.VerticalFlip(p=self.vertical_flip))
-        return A.Compose(ops)
+        return A.Compose(ops or [A.NoOp()])
 
 
 class DIS5KDataset(Dataset):
@@ -113,10 +116,13 @@ class DIS5KDataset(Dataset):
         <root>/language_prompts/<split>.json   # {"<name>.jpg": str | list[str]}
 
     Each item is a dict:
-        image  float32 (3, res, res), normalised to (x/255 - mean) / std
-        mask   float32 (1, res, res) in [0, 1]
+        image  float32 (3, H, W), normalised to (x/255 - mean) / std
+        mask   float32 (1, H, W) in [0, 1]
         prompt str ("" when language pairing is off)
         name   str, the image filename
+
+    H and W equal `params.resolution` when `resize` is true. Training with PAIP
+    sets `resize` false so the collate can mix at native resolution.
     """
 
     def __init__(
@@ -124,6 +130,7 @@ class DIS5KDataset(Dataset):
         params: DIS5KParams,
         use_transforms: bool = True,
         transforms: DIS5KTransforms | None = None,
+        resize: bool = True,
     ):
         self.params = params
         if params.split not in SPLITS:
@@ -131,9 +138,11 @@ class DIS5KDataset(Dataset):
         if params.prompt_strategy not in ("random", "first"):
             raise ValueError(f"unknown prompt_strategy {params.prompt_strategy!r}")
 
-        # use_transforms toggles augmentation only; the resize runs either way
+        self.resize = resize
         self.transform_params = transforms or DIS5KTransforms()
-        self.transforms = self.transform_params.build(params.resolution, train=use_transforms)
+        self.transforms = self.transform_params.build(
+            params.resolution, train=use_transforms, resize=resize
+        )
 
         root = Path(params.root)
         self.image_dir = root / params.split / "im"
@@ -146,10 +155,12 @@ class DIS5KDataset(Dataset):
         data = OmegaConf.to_container(config.data, resolve=True)
         transforms = data.pop("transforms", None)
         use_transforms = data.pop("use_transforms", True)
+        resize = data.pop("resize", True)
         return cls(
             DIS5KParams(**data),
             use_transforms=use_transforms,
             transforms=DIS5KTransforms.from_config(transforms),
+            resize=resize,
         )
 
     def load_data(self) -> None:
@@ -241,12 +252,22 @@ def build_dataloader(
     if use_paip is None:
         use_paip = is_train
 
-    dataset = DIS5KDataset(params, use_transforms=is_train, transforms=transforms)
+    # PAIP composites at native resolution, then resizes once to `params.resolution`.
+    dataset = DIS5KDataset(
+        params,
+        use_transforms=is_train,
+        transforms=transforms,
+        resize=not use_paip,
+    )
 
     collate_fn = None
     if use_paip:
         # partial, not a lambda: num_workers > 0 has to pickle this
-        collate_fn = partial(paip_collate, rng=random.Random(seed) if seed is not None else None)
+        collate_fn = partial(
+            paip_collate,
+            rng=random.Random(seed) if seed is not None else None,
+            resolution=params.resolution,
+        )
 
     return DataLoader(
         dataset,

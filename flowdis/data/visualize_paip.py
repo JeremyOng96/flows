@@ -210,8 +210,8 @@ def build_batch_grid(
 ) -> np.ndarray:
     """Run paip_collate over real samples and draw the batch it produces.
 
-    This is the training view: each element already resized back to the model
-    resolution, with its randomly chosen variant and matching prompt.
+    This is the training view: PAIP at native resolution, then one resize to
+    `size`, with its randomly chosen variant and matching prompt.
     """
     import torch
 
@@ -222,8 +222,6 @@ def build_batch_grid(
     for name in names:
         image = cv2.imread(str(im_dir / name), cv2.IMREAD_COLOR)
         mask = cv2.imread(str(gt_dir / f"{Path(name).stem}.png"), cv2.IMREAD_GRAYSCALE)
-        image = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
-        mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         batch.append(
             {
@@ -234,7 +232,7 @@ def build_batch_grid(
             }
         )
 
-    out = paip_collate(batch, rng=rng)
+    out = paip_collate(batch, rng=rng, resolution=size)
     panels = []
     for i in range(len(out["image"])):
         rgb = out["image"][i].permute(1, 2, 0).numpy() * std + mean

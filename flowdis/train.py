@@ -103,12 +103,23 @@ class FlowDIS(L.LightningModule):
             Path(self.config.schnell_dir) / "flux1-schnell.safetensors",
             device="cpu",
         )
-        self.vae = AutoencoderKL.from_pretrained(self.config.vae_dir, torch_dtype=torch.bfloat16)
-        self.t5 = T5TextEncoder(self.config.t5_dir, self.config.t5_tokenizer_dir)
-        self.clip = CLIPTextEncoder(self.config.clip_dir, self.config.clip_tokenizer_dir)
-        _freeze(self.vae)
-        _freeze(self.t5)
-        _freeze(self.clip)
+        # Only Flux is a Lightning submodule (FSDP shards it). VAE/T5/CLIP stay
+        # off the tree so they are not gathered onto every GPU.
+        vae = AutoencoderKL.from_pretrained(self.config.vae_dir, torch_dtype=torch.bfloat16)
+        t5 = T5TextEncoder(self.config.t5_dir, self.config.t5_tokenizer_dir)
+        clip = CLIPTextEncoder(self.config.clip_dir, self.config.clip_tokenizer_dir)
+        _freeze(vae)
+        _freeze(t5)
+        _freeze(clip)
+        object.__setattr__(self, "vae", vae)
+        object.__setattr__(self, "t5", t5.to("cpu"))
+        object.__setattr__(self, "clip", clip.to("cpu"))
+
+    def on_fit_start(self) -> None:
+        # Flux is FSDP-sharded (~1.5B/GPU). Encoders fit beside it on a 40GB card.
+        self.vae.to(device=self.device, dtype=torch.bfloat16)
+        self.t5.to(device=self.device)
+        self.clip.to(device=self.device)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -235,6 +246,22 @@ class FlowDIS(L.LightningModule):
             shuffle=shuffle,
         )
 
+    def _pixel_loader(self, split: str, prompt_strategy: str, *, shuffle: bool, use_paip: bool):
+        return build_dataloader(
+            self._loader_params(split, prompt_strategy),
+            batch_size=self.config.loader.batch_size,
+            num_workers=self.config.loader.num_workers,
+            shuffle=shuffle,
+            use_paip=use_paip,
+            seed=self.config.loader.seed,
+        )
+
+    def _test_splits(self) -> list[str]:
+        splits = self.config.data.get("test_splits")
+        if splits:
+            return list(splits)
+        return [self.config.data.val_split]
+
     def train_dataloader(self):
         if self.use_cache:
             return self._cached_loader(
@@ -242,11 +269,11 @@ class FlowDIS(L.LightningModule):
                 self.config.data.train_prompt_strategy,
                 shuffle=True,
             )
-        return build_dataloader(
-            self._loader_params(self.config.data.train_split, self.config.data.train_prompt_strategy),
-            batch_size=self.config.loader.batch_size,
-            num_workers=self.config.loader.num_workers,
-            seed=self.config.loader.seed,
+        return self._pixel_loader(
+            self.config.data.train_split,
+            self.config.data.train_prompt_strategy,
+            shuffle=True,
+            use_paip=True,
         )
 
     def val_dataloader(self):
@@ -256,13 +283,50 @@ class FlowDIS(L.LightningModule):
                 self.config.data.val_prompt_strategy,
                 shuffle=False,
             )
-        return build_dataloader(
-            self._loader_params(self.config.data.val_split, self.config.data.val_prompt_strategy),
-            batch_size=self.config.loader.batch_size,
-            num_workers=self.config.loader.num_workers,
+        return self._pixel_loader(
+            self.config.data.val_split,
+            self.config.data.val_prompt_strategy,
             shuffle=False,
             use_paip=False,
         )
+
+    def test_dataloader(self):
+        prompt_strategy = self.config.data.get("test_prompt_strategy", self.config.data.val_prompt_strategy)
+        return [
+            self._pixel_loader(split, prompt_strategy, shuffle=False, use_paip=False)
+            for split in self._test_splits()
+        ]
+
+    def on_test_epoch_start(self) -> None:
+        self._test_split_names = self._test_splits()
+        self._test_metrics = [SegmentationMetrics() for _ in self._test_split_names]
+
+    @torch.no_grad()
+    def test_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0) -> None:
+        image = (batch["image"].float() * 0.5 + 0.5).clamp(0, 1)
+        prediction = self.flow_matching_integration(image, list(batch["prompt"]))
+        self._test_metrics[dataloader_idx].update(prediction, batch["mask"])
+        if batch_idx == 0:
+            split = self._test_split_names[dataloader_idx]
+            self._log_segmentation(image, prediction, batch, key=f"test/{split}/segmentation")
+
+    def on_test_epoch_end(self) -> None:
+        te_names = {"DIS-TE1", "DIS-TE2", "DIS-TE3", "DIS-TE4"}
+        gathered = [self._gathered_metrics(metrics) for metrics in self._test_metrics]
+        for split, metrics in zip(self._test_split_names, gathered):
+            for name, value in metrics.compute().items():
+                self.log(f"test/{split}/{name}", value, sync_dist=False)
+        te = [metrics for split, metrics in zip(self._test_split_names, gathered) if split in te_names]
+        if len(te) == 4:
+            combined = SegmentationMetrics()
+            for metrics in te:
+                combined._mae.extend(metrics._mae)
+                combined._weighted_f.extend(metrics._weighted_f)
+                combined._structure.extend(metrics._structure)
+                combined._f_curves.extend(metrics._f_curves)
+                combined._e_curves.extend(metrics._e_curves)
+            for name, value in combined.compute().items():
+                self.log(f"test/DIS-TE/{name}", value, sync_dist=False)
 
 
     def flow_matching_integration(
@@ -287,8 +351,8 @@ class FlowDIS(L.LightningModule):
         shift = self.vae.config.shift_factor
         scale = self.vae.config.scaling_factor
         latent_image = self._encode_latent(image)
-        latent_prompt_t5 = self.t5(prompt)
-        latent_prompt_clip = self.clip(prompt)
+        latent_prompt_t5 = self.t5(prompt).to(device=self.device)
+        latent_prompt_clip = self.clip(prompt).to(device=self.device)
         mask = pack_latent(latent_image)
         image_tokens = pack_latent(latent_image)
         mask_ids = image_position_ids(latent_image)
@@ -308,25 +372,31 @@ class FlowDIS(L.LightningModule):
 
         mask = unpack_latent(mask, latent_image.shape[-2], latent_image.shape[-1])
         mask = mask / scale + shift
-        mask = self.vae.decode(mask.to(dtype=self.vae.dtype)).sample.clamp(-1, 1)
+        # Algorithm 1: decode RGB, map VAE [-1, 1] to [0, 1], average, then clip.
+        mask = self.vae.decode(mask.to(dtype=self.vae.dtype)).sample
         return ((mask + 1) / 2).mean(dim=1).clamp(0, 1)
 
-    def _validation_scores(self) -> dict[str, float]:
+    def _gathered_metrics(self, metrics: SegmentationMetrics) -> SegmentationMetrics:
         if self.trainer.world_size == 1:
-            return self._val_metrics.compute()
+            return metrics
         gathered: list[SegmentationMetrics | None] = [None] * self.trainer.world_size
-        dist.all_gather_object(gathered, self._val_metrics)
+        dist.all_gather_object(gathered, metrics)
         merged = SegmentationMetrics()
-        for metrics in gathered:
-            merged._mae.extend(metrics._mae)
-            merged._weighted_f.extend(metrics._weighted_f)
-            merged._structure.extend(metrics._structure)
-            merged._f_curves.extend(metrics._f_curves)
-            merged._e_curves.extend(metrics._e_curves)
-        return merged.compute()
+        for item in gathered:
+            merged._mae.extend(item._mae)
+            merged._weighted_f.extend(item._weighted_f)
+            merged._structure.extend(item._structure)
+            merged._f_curves.extend(item._f_curves)
+            merged._e_curves.extend(item._e_curves)
+        return merged
+
+    def _validation_scores(self) -> dict[str, float]:
+        return self._gathered_metrics(self._val_metrics).compute()
 
     @torch.no_grad()
-    def _log_segmentation(self, image: Tensor, prediction: Tensor, batch: dict) -> None:
+    def _log_segmentation(
+        self, image: Tensor, prediction: Tensor, batch: dict, key: str = "val/segmentation"
+    ) -> None:
         import wandb
 
         panels = []
@@ -340,7 +410,23 @@ class FlowDIS(L.LightningModule):
                 axis=1,
             )
             panels.append(wandb.Image(side_by_side, caption=str(caption)[:160]))
-        self.logger.experiment.log({"val/segmentation": panels})
+        self.logger.experiment.log({key: panels})
+
+
+def _accumulate_grad_batches(cfg: DictConfig) -> int:
+    """Keep the paper's global batch of 32 across whatever GPU count is visible."""
+    target = int(getattr(cfg.loader, "global_batch_size", 32))
+    per_gpu = int(cfg.loader.batch_size)
+    devices = cfg.trainer.devices
+    if devices == "auto":
+        n_dev = torch.cuda.device_count() or 1
+    elif isinstance(devices, (list, tuple)):
+        n_dev = len(devices)
+    else:
+        n_dev = int(devices)
+    n_dev *= int(cfg.trainer.num_nodes)
+    return max(1, target // (per_gpu * max(n_dev, 1)))
+
 
 def _load_wandb_env(cfg: DictConfig) -> None:
     env_file = Path(cfg.wandb.env_file)
@@ -356,23 +442,49 @@ def _load_wandb_env(cfg: DictConfig) -> None:
     os.environ["WANDB_BASE_URL"] = "https://api.wandb.ai"
 
 
+def _trainer_strategy(cfg: DictConfig):
+    name = str(cfg.trainer.strategy)
+    if name != "fsdp":
+        return name
+    from lightning.pytorch.strategies import FSDPStrategy
+
+    from flowdis.model.flux import DoubleStreamBlock, SingleStreamBlock
+
+    blocks = {DoubleStreamBlock, SingleStreamBlock}
+    return FSDPStrategy(
+        sharding_strategy="FULL_SHARD",
+        auto_wrap_policy=blocks,
+        activation_checkpointing_policy=blocks,
+    )
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     from lightning.pytorch.loggers import WandbLogger
 
     _load_wandb_env(cfg)
     model = FlowDIS(cfg)
-    trainer = L.Trainer(
+    logger = False
+    if not cfg.wandb.get("disabled", False):
+        logger = WandbLogger(project=cfg.wandb.project, save_dir=cfg.root)
+    trainer_kwargs = dict(
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
         num_nodes=cfg.trainer.num_nodes,
-        strategy=cfg.trainer.strategy,
+        strategy=_trainer_strategy(cfg),
         max_steps=cfg.trainer.max_steps,
         precision=cfg.trainer.precision,
         log_every_n_steps=cfg.trainer.log_every_n_steps,
-        logger=WandbLogger(project=cfg.wandb.project, save_dir=cfg.root),
+        accumulate_grad_batches=_accumulate_grad_batches(cfg),
+        logger=logger,
     )
+    for key in ("num_sanity_val_steps", "limit_val_batches", "limit_train_batches"):
+        if key in cfg.trainer:
+            trainer_kwargs[key] = cfg.trainer[key]
+    trainer = L.Trainer(**trainer_kwargs)
     trainer.fit(model)
+    if cfg.trainer.get("run_test", False):
+        trainer.test(model)
 
 
 if __name__ == "__main__":

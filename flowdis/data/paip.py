@@ -241,30 +241,66 @@ def paip_mix(
     )
 
 
+def resize_hw(
+    image: np.ndarray, mask: np.ndarray, width: int, height: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize a mixed (or passthrough) pair to the model resolution.
+
+    Downscales with INTER_AREA and upscales with INTER_CUBIC. Native DIS images
+    are often larger than 1024, so the training path is almost always a downsample
+    after PAIP.
+    """
+    if image.shape[0] == height and image.shape[1] == width:
+        return image, np.clip(mask, 0.0, 1.0)
+    shrinking = height < image.shape[0] or width < image.shape[1]
+    interp = cv2.INTER_AREA if shrinking else cv2.INTER_CUBIC
+    return (
+        cv2.resize(image, (width, height), interpolation=interp),
+        np.clip(cv2.resize(mask, (width, height), interpolation=interp), 0.0, 1.0),
+    )
+
+
+def _to_chw(image: np.ndarray, mask: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1),
+        torch.from_numpy(np.ascontiguousarray(mask)).unsqueeze(0),
+    )
+
+
 def paip_collate(
     batch: Sequence[dict],
     rng: random.Random | None = None,
     probability: float = 1.0,
     scale_range: tuple[float, float] = (1.0, 1.0),
+    resolution: int | None = None,
 ) -> dict:
     """torch collate_fn applying PAIP across a batch of DIS5KDataset samples.
 
     Each sample is paired with another drawn from the same batch, as the paper
-    specifies. Padding makes the composite larger than the input, so it is
-    resized back to the original resolution before stacking.
+    specifies. Mixing runs at the sample's native resolution; the composite is
+    then resized once to `resolution` (or back to the reference size when
+    `resolution` is None) so the batch can stack.
 
     A batch of one is returned unmixed: there is no other sample to pair with.
     """
-    
-
     rng = rng or random.Random()
     images, masks, prompts, names, variants = [], [], [], [], []
 
     for index, sample in enumerate(batch):
         image_t, mask_t = sample["image"], sample["mask"]
-        target_h, target_w = image_t.shape[-2:]
+        if resolution is None:
+            target_h, target_w = image_t.shape[-2:]
+        else:
+            target_h = target_w = resolution
 
         if len(batch) < 2 or rng.random() >= probability:
+            image, mask = resize_hw(
+                image_t.permute(1, 2, 0).numpy(),
+                mask_t[0].numpy(),
+                target_w,
+                target_h,
+            )
+            image_t, mask_t = _to_chw(image, mask)
             images.append(image_t)
             masks.append(mask_t)
             prompts.append(sample.get("prompt", ""))
@@ -288,15 +324,10 @@ def paip_collate(
             scale_range=scale_range,
         )
 
-        image = cv2.resize(result.image, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        # INTER_AREA on floats can overshoot by ~1e-7; masks must stay in [0, 1]
-        mask = np.clip(
-            cv2.resize(result.mask, (target_w, target_h), interpolation=cv2.INTER_AREA),
-            0.0,
-            1.0,
-        )
-        images.append(torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1))
-        masks.append(torch.from_numpy(np.ascontiguousarray(mask)).unsqueeze(0))
+        image, mask = resize_hw(result.image, result.mask, target_w, target_h)
+        image_t, mask_t = _to_chw(image, mask)
+        images.append(image_t)
+        masks.append(mask_t)
         prompts.append(result.prompt)
         names.append(sample.get("name", ""))
         variants.append(result.variant)
